@@ -46,6 +46,36 @@ def _componentes_grandes(mask, area_min_px):
     return salida
 
 
+def _filtrar_componentes_agua(mask, H, S, V, R, G, B, total_px, area_min_px):
+    """Conserva cuerpos de agua probables y descarta vegetacion/objetos verdes."""
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    salida = np.zeros_like(mask)
+
+    for label in range(1, num_labels):
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area < area_min_px:
+            continue
+
+        pix = labels == label
+        h_media = float(np.mean(H[pix]))
+        s_media = float(np.mean(S[pix]))
+        v_media = float(np.mean(V[pix]))
+        r_media = float(np.mean(R[pix]))
+        g_media = float(np.mean(G[pix]))
+        b_media = float(np.mean(B[pix]))
+        exg_media = float(np.mean(2 * G[pix] - R[pix] - B[pix]))
+
+        componente_grande = area >= total_px * 0.08
+        azul_turquesa = h_media >= 80 and b_media >= r_media + 7
+        agua_verde_extensa = area >= total_px * 0.035 and s_media < 92 and exg_media < 36
+        muy_brillante = v_media > 170 and s_media < 35
+
+        if not muy_brillante and (componente_grande or azul_turquesa or agua_verde_extensa):
+            salida[pix] = 255
+
+    return salida
+
+
 def _crear_mascara_contexto(H, S, V, R, G, B, alto_px, ancho_px):
     """Estima agua, costa y clases que suelen producir falsos positivos."""
     total_px = alto_px * ancho_px
@@ -92,10 +122,20 @@ def _crear_mascara_contexto(H, S, V, R, G, B, alto_px, ancho_px):
     k_agua = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd_size(min_dim * 0.009),) * 2)
     agua_u8 = cv2.morphologyEx(agua_u8, cv2.MORPH_OPEN, k_agua)
     agua_u8 = cv2.morphologyEx(agua_u8, cv2.MORPH_CLOSE, k_agua, iterations=2)
-    agua_u8 = _componentes_grandes(agua_u8, max(450, int(total_px * 0.0035)))
+    agua_u8 = _filtrar_componentes_agua(
+        agua_u8,
+        H,
+        S,
+        V,
+        R,
+        G,
+        B,
+        total_px,
+        max(450, int(total_px * 0.0035)),
+    )
 
     hay_agua = cv2.countNonZero(agua_u8) >= total_px * 0.025
-    radio_costa = _odd_size(min_dim * 0.055, min_size=11)
+    radio_costa = _odd_size(min_dim * 0.045, min_size=11)
     k_costa = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radio_costa, radio_costa))
     cerca_agua_u8 = cv2.dilate(agua_u8, k_costa, iterations=1)
 
@@ -116,24 +156,32 @@ def _crear_candidatos_sargazo(H, S, V, R, G, B, contexto):
     v_max = min(190, max(105, np.percentile(V, 86) + 12))
     s_max = min(205, max(115, np.percentile(S, 96)))
 
-    tono_rojo_marron = (H <= 30) | (H >= 154)
-    tono_ocre_marron = (H > 30) & (H <= 52) & (S > 18)
+    tono_rojo_marron = (H <= 26) | (H >= 150)
+    tono_ocre_marron = (H > 26) & (H <= 40) & (S > 20) & ((R - G) > 3) & ((R - B) > 12)
 
     mas_rojo_que_azul = (R - B) > 5
     balance_marron = (R - G) > -3
     marron_oscuro = (
         (V < min(v_max, np.percentile(V, 67)))
         & (S > 8)
-        & ((H <= 42) | (H >= 150))
+        & ((H <= 34) | (H >= 150))
         & (R > B + 5)
         & (R >= G - 2)
     )
 
-    cromatico = (
+    semillas = (
         ((tono_rojo_marron | tono_ocre_marron) & (S > 9) & (S < s_max) & (V > v_min) & (V < v_max))
         & mas_rojo_que_azul
         & balance_marron
     ) | marron_oscuro
+
+    crecimiento_local = (
+        (((H <= 62) | (H >= 145)) & (S > 8) & (S < min(215, s_max + 22)))
+        & (V > v_min)
+        & (V < min(205, v_max + 28))
+        & ((R - B) > -3)
+        & ((R - G) > -28)
+    )
 
     exclusiones = (
         contexto["vegetacion"]
@@ -141,9 +189,19 @@ def _crear_candidatos_sargazo(H, S, V, R, G, B, contexto):
         | contexto["artificial_calido"]
     )
 
-    candidatos = cromatico & ~exclusiones
+    semillas = semillas & ~exclusiones
+    crecimiento_local = crecimiento_local & ~exclusiones
 
-    return _u8(candidatos), _u8(cromatico & ~exclusiones)
+    if contexto["hay_agua"]:
+        cerca_agua = contexto["cerca_agua_u8"] > 0
+        semillas &= cerca_agua
+        crecimiento_local &= cerca_agua
+
+    k_crecer = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))
+    vecindad_semillas = cv2.dilate(_u8(semillas), k_crecer, iterations=1) > 0
+    candidatos = semillas | (crecimiento_local & vecindad_semillas)
+
+    return _u8(candidatos), _u8(semillas | crecimiento_local)
 
 
 def _postprocesar_mascara(mask, alto_px, ancho_px):
@@ -152,11 +210,11 @@ def _postprocesar_mascara(mask, alto_px, ancho_px):
 
     k_mediana = _odd_size(min_dim * 0.008, min_size=3)
     k_apertura = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd_size(min_dim * 0.006),) * 2)
-    k_cierre = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd_size(min_dim * 0.018),) * 2)
+    k_cierre = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd_size(min_dim * 0.022),) * 2)
 
     salida = cv2.medianBlur(mask, k_mediana)
     salida = cv2.morphologyEx(salida, cv2.MORPH_OPEN, k_apertura)
-    salida = cv2.morphologyEx(salida, cv2.MORPH_CLOSE, k_cierre, iterations=2)
+    salida = cv2.morphologyEx(salida, cv2.MORPH_CLOSE, k_cierre, iterations=1)
     return salida
 
 
@@ -203,6 +261,7 @@ def _filtrar_contornos(mask, contexto, H, S, V, R, G, B, alto_px, ancho_px):
         s_media = float(np.mean(S[pix]))
         v_media = float(np.mean(V[pix]))
         r_menos_g = float(np.mean(R[pix] - G[pix]))
+        r_menos_b = float(np.mean(R[pix] - B[pix]))
 
         compacto_artificial = (
             circularidad > 0.42
@@ -223,15 +282,23 @@ def _filtrar_contornos(mask, contexto, H, S, V, R, G, B, alto_px, ancho_px):
             agua_frac = cv2.countNonZero(cv2.bitwise_and(region, agua_u8)) / area_px
             dist_mediana = float(np.median(distancia_agua[pix]))
 
-            blob_natural_sin_contexto = elongacion >= 4.0 and area_px >= area_min_px * 10
-            tiene_contexto = cerca_frac >= 0.35 or agua_frac >= 0.06
-            lejos_de_costa = dist_mediana > contexto["radio_costa"] * 0.75 and agua_frac < 0.06
+            blob_natural_sin_contexto = elongacion >= 5.5 and area_px >= area_min_px * 18
+            tiene_contexto = cerca_frac >= 0.72 or agua_frac >= 0.10
+            lejos_de_costa = dist_mediana > contexto["radio_costa"] * 0.58 and agua_frac < 0.08
             pequeno_sin_contacto = area_px < area_min_px * 7 and elongacion < 3.2 and agua_frac < 0.03
+            pequeno_compacto = area_px < area_min_px * 9 and elongacion < 2.45
+            lobulo_costero = (
+                area_px >= area_min_px * 2.2
+                and cerca_frac >= 0.92
+                and r_menos_b > 7
+                and r_menos_g > -6
+            )
 
             if (
                 (not tiene_contexto and not blob_natural_sin_contexto)
                 or (lejos_de_costa and not blob_natural_sin_contexto)
                 or pequeno_sin_contacto
+                or (pequeno_compacto and not lobulo_costero)
             ):
                 continue
 
@@ -240,6 +307,106 @@ def _filtrar_contornos(mask, contexto, H, S, V, R, G, B, alto_px, ancho_px):
 
     blobs_validos.sort(key=lambda item: -item[0])
     return mascara_final, blobs_validos
+
+
+def _expandir_bordes_conectados(mask, contexto, H, S, V, R, G, B, alto_px, ancho_px):
+    """
+    Recupera grosor y lobulos pegados a la franja principal sin aceptar objetos
+    aislados. El crecimiento solo sale de componentes grandes ya validadas.
+    """
+    total_px = alto_px * ancho_px
+    area_semilla_px = max(700, int(total_px * 0.004))
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    semillas = np.zeros_like(mask)
+    for label in range(1, num_labels):
+        if stats[label, cv2.CC_STAT_AREA] >= area_semilla_px:
+            semillas[labels == label] = 255
+
+    if cv2.countNonZero(semillas) == 0:
+        return mask
+
+    # Mascara mas permisiva para bordes de sargazo humedo/ocre que suelen ser
+    # mas verdosos o claros que el centro de la acumulacion.
+    borde_suave = (
+        (((H <= 76) | (H >= 145)) & (S > 5) & (S < 180))
+        & (V > 28)
+        & (V < 205)
+        & ((R - B) > -15)
+        & ((R - G) > -38)
+        & (contexto["cerca_agua_u8"] > 0)
+    )
+
+    vegetacion_densa = (H >= 45) & (H <= 88) & (S > 70) & (G > R + 18) & (G > B + 12)
+    arena_clara = (V > 165) & (S < 38) & (R > 110) & (G > 105) & (B > 90)
+    artificial_calido = (
+        ((H <= 24) | (H >= 165))
+        & (S > 105)
+        & (V > 92)
+        & ((R - G) > 12)
+        & ((R - B) > 20)
+    )
+
+    borde_suave = _u8(borde_suave & ~vegetacion_densa & ~arena_clara & ~artificial_calido)
+
+    k_crecimiento = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    crecimiento = semillas.copy()
+    for _ in range(8):
+        crecimiento = cv2.bitwise_and(cv2.dilate(crecimiento, k_crecimiento, iterations=1), borde_suave)
+
+    expandida = cv2.bitwise_or(mask, crecimiento)
+
+    # Une cortes cortos entre tramos grandes de la misma franja. No se usa en
+    # objetos pequenos para no reconectar rocas o estructuras aisladas.
+    contornos, _ = cv2.findContours(expandida, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    grandes = []
+    for cnt in contornos:
+        region = np.zeros_like(mask)
+        cv2.drawContours(region, [cnt], -1, 255, -1)
+        area_px = cv2.countNonZero(region)
+        if area_px >= area_semilla_px:
+            grandes.append((area_px, cnt))
+
+    grosor_puente = max(5, _odd_size(min(alto_px, ancho_px) * 0.012))
+    distancia_max = min(alto_px, ancho_px) * 0.075
+
+    for i in range(len(grandes)):
+        pts_i = grandes[i][1].reshape(-1, 2)
+        pts_i = pts_i[:: max(1, len(pts_i) // 250)]
+        for j in range(i + 1, len(grandes)):
+            pts_j = grandes[j][1].reshape(-1, 2)
+            pts_j = pts_j[:: max(1, len(pts_j) // 250)]
+
+            dif = pts_i[:, None, :] - pts_j[None, :, :]
+            dist2 = np.sum(dif * dif, axis=2)
+            idx = np.unravel_index(np.argmin(dist2), dist2.shape)
+            distancia = math.sqrt(float(dist2[idx]))
+
+            if distancia <= distancia_max:
+                p1 = tuple(int(v) for v in pts_i[idx[0]])
+                p2 = tuple(int(v) for v in pts_j[idx[1]])
+                cv2.line(expandida, p1, p2, 255, thickness=grosor_puente)
+
+    return expandida
+
+
+def _contornos_validos_desde_mascara(mask, alto_px, ancho_px):
+    """Reconstruye la lista de blobs despues de una expansion controlada."""
+    area_min_px = max(70, int(alto_px * ancho_px * 0.00016))
+    contornos, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    mascara_limpia = np.zeros_like(mask)
+    blobs_validos = []
+
+    for cnt in contornos:
+        region = np.zeros_like(mask)
+        cv2.drawContours(region, [cnt], -1, 255, -1)
+        area_px = cv2.countNonZero(region)
+        if area_px >= area_min_px:
+            cv2.drawContours(mascara_limpia, [cnt], -1, 255, -1)
+            blobs_validos.append((area_px, cnt))
+
+    blobs_validos.sort(key=lambda item: -item[0])
+    return mascara_limpia, blobs_validos
 
 
 def analizar_sargazo_fotogrametria(
@@ -331,6 +498,10 @@ def analizar_sargazo_fotogrametria(
     mascara_final, blobs_validos = _filtrar_contornos(
         mascara_morfologica, contexto, H, S, V, R, G, B, alto_px, ancho_px
     )
+    mascara_final = _expandir_bordes_conectados(
+        mascara_final, contexto, H, S, V, R, G, B, alto_px, ancho_px
+    )
+    mascara_final, blobs_validos = _contornos_validos_desde_mascara(mascara_final, alto_px, ancho_px)
 
     # ------------------------------------------------------------------
     # 6. Calculo de area total y modelo logistico

@@ -1,50 +1,72 @@
-# Sargazo Detección
+# Sargazo Deteccion
 
-Herramienta de procesamiento digital de imágenes (PDI) para detectar y estimar el área de sargazo en imágenes aéreas/satelitales, con cálculo de logística de recolección.
+Herramienta de procesamiento digital de imagenes (PDI) para detectar y estimar
+el area de sargazo en imagenes aereas/satelitales, con calculo basico de
+logistica de recoleccion.
 
-## ¿Qué hace?
+## Que hace
 
-- Segmenta sargazo usando segmentación multi-condición en espacio HSV + índices de color
-- Descarta falsos positivos (agua, vegetación, arena, techos)
-- Aplica morfología para limpiar la máscara resultante
-- Calcula el área real en m² usando fotogrametría (GSD)
-- Estima el número de camiones necesarios para recolectar la biomasa
+- Segmenta candidatos de sargazo con umbrales HSV/RGB adaptativos por imagen.
+- Estima contexto de agua/costa para reducir falsos positivos tierra adentro.
+- Descarta vegetacion, arena clara, techos, sombrillas y objetos calidos muy
+  saturados.
+- Filtra blobs por area, distancia al agua y forma geometrica.
+- Calcula area real en m2 usando fotogrametria (GSD).
+- Estima volumen y camiones requeridos con un espesor de biomasa asumido.
 
 ## Requisitos
 
 ```bash
-pip install opencv-python numpy matplotlib
+pip install -r requirements.txt
 ```
 
-## Uso
+## Uso rapido
 
 ```python
 from actividad_final import analizar_sargazo_fotogrametria
 
 resultado = analizar_sargazo_fotogrametria(
-    ruta_imagen="tu_imagen.jpeg",
-    altura_vuelo_m=50       # altitud en metros
+    ruta_imagen="prueba1.jpeg",
+    altura_vuelo_m=50,
 )
+
+print(resultado)
 ```
 
-O bien ejecuta directamente:
+Tambien se puede ejecutar directamente:
 
 ```bash
 python actividad_final.py
 ```
 
-> Cambia `ruta_imagen` y `altura_vuelo_m` en el bloque `__main__` según tu caso.
+## Guardar diagnosticos
 
-## Parámetros
+Para evaluar la mascara sin abrir ventanas:
 
-| Parámetro | Descripción | Default |
+```python
+resultado = analizar_sargazo_fotogrametria(
+    ruta_imagen="prueba1.jpeg",
+    altura_vuelo_m=50,
+    mostrar=False,
+    guardar_figura="salidas/prueba1_segmentacion.png",
+)
+```
+
+Esto genera la figura del pipeline y un reporte con sufijo `_reporte`.
+
+## Parametros
+
+| Parametro | Descripcion | Default |
 |---|---|---|
-| `ruta_imagen` | Ruta a la imagen aérea/satelital | — |
-| `altura_vuelo_m` | Altitud de toma en metros | — |
-| `fov_grados` | Campo de visión horizontal de la cámara | `82.0°` |
+| `ruta_imagen` | Ruta a la imagen aerea/satelital | requerido |
+| `altura_vuelo_m` | Altitud de toma en metros | requerido |
+| `fov_grados` | Campo de vision horizontal de la camara | `82.0` |
+| `mostrar` | Muestra figuras con matplotlib | `True` |
+| `guardar_figura` | Guarda la figura diagnostica en disco | `None` |
+| `devolver_mascaras` | Devuelve mascaras intermedias para depuracion | `False` |
 
-## Salida
+## Nota
 
-- Visualización con 6 paneles del pipeline de segmentación
-- Reporte con GSD, área estimada, volumen y camiones requeridos
-- Diccionario con `gsd_m`, `area_m2` y `camiones`
+El algoritmo sigue siendo PDI clasico, no un modelo entrenado. Por eso es mas
+flexible que un umbral HSV fijo, pero en imagenes muy distintas puede requerir
+ajustar reglas o migrar a un modelo supervisado con ejemplos anotados.

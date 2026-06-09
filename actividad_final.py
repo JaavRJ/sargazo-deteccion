@@ -413,6 +413,8 @@ def analizar_sargazo_fotogrametria(
     ruta_imagen,
     altura_vuelo_m,
     fov_grados=82.0,
+    espesor_biomasa_m=0.05,
+    capacidad_camion_m3=14.0,
     mostrar=True,
     guardar_figura=None,
     devolver_mascaras=False,
@@ -429,6 +431,10 @@ def analizar_sargazo_fotogrametria(
         Altitud de toma en metros.
     fov_grados: float
         Campo de vision horizontal de la camara.
+    espesor_biomasa_m: float
+        Espesor promedio asumido para estimar volumen de biomasa.
+    capacidad_camion_m3: float
+        Capacidad promedio de un camion o recurso de recoleccion.
     mostrar: bool
         Si True, muestra las figuras con matplotlib.
     guardar_figura: str | None
@@ -508,9 +514,8 @@ def analizar_sargazo_fotogrametria(
     # ------------------------------------------------------------------
     pixeles_sargazo = cv2.countNonZero(mascara_final)
     area_total_m2 = pixeles_sargazo * area_px_m2
-    volumen_m3 = area_total_m2 * 0.05
-    cap_camion_m3 = 14.0
-    camiones_req = int(np.ceil(volumen_m3 / cap_camion_m3)) if volumen_m3 > 0 else 0
+    volumen_m3 = area_total_m2 * espesor_biomasa_m
+    camiones_req = int(np.ceil(volumen_m3 / capacidad_camion_m3)) if volumen_m3 > 0 else 0
 
     print("\n  --- RESULTADOS ---")
     print(f"  Blobs sargazo detectados : {len(blobs_validos)}")
@@ -598,9 +603,9 @@ def analizar_sargazo_fotogrametria(
         f"  Area real estimada        : {area_total_m2:,.2f} m2\n\n"
         "LOGISTICA DE RECOLECCION\n"
         f"{'-' * 38}\n"
-        "  Espesor biomasa asumido   : 0.05 m\n"
+        f"  Espesor biomasa asumido   : {espesor_biomasa_m:.3f} m\n"
         f"  Volumen de biomasa        : {volumen_m3:,.2f} m3\n"
-        f"  Capacidad camion          : {cap_camion_m3:.1f} m3\n"
+        f"  Capacidad camion          : {capacidad_camion_m3:.1f} m3\n"
         f"  Camiones requeridos       : {camiones_req}\n"
     )
 
@@ -637,6 +642,9 @@ def analizar_sargazo_fotogrametria(
         "camiones": camiones_req,
         "blobs": len(blobs_validos),
         "pixeles_sargazo": pixeles_sargazo,
+        "volumen_m3": volumen_m3,
+        "espesor_biomasa_m": espesor_biomasa_m,
+        "capacidad_camion_m3": capacidad_camion_m3,
     }
 
     if salida_figura:

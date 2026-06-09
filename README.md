@@ -16,11 +16,52 @@ logistica de recoleccion.
 
 ## Requisitos
 
+Python 3.10+ y Node.js 18+.
+
+Instala dependencias de Python:
+
 ```bash
 pip install -r requirements.txt
 ```
 
-## Uso rapido
+Instala dependencias de React:
+
+```bash
+npm install
+```
+
+## Como correr la app web
+
+Usa dos terminales abiertas en la carpeta del proyecto.
+
+Terminal 1 - backend Python:
+
+```bash
+.venv\Scripts\python.exe server.py
+```
+
+Terminal 2 - frontend React:
+
+```bash
+npm run dev
+```
+
+Luego abre:
+
+```text
+http://127.0.0.1:5173
+```
+
+La web permite seleccionar una imagen, capturar altitud/FOV y ajustar los datos
+de recoleccion. Al terminar muestra area, volumen, camiones requeridos y una
+vista segmentada lista para descargar.
+
+El backend queda en `http://127.0.0.1:5000`. Los resultados temporales se guardan
+en `salidas/`, carpeta ignorada por Git.
+
+Para apagar la app, detén ambos procesos con `Ctrl+C` en sus terminales.
+
+## Uso desde Python
 
 ```python
 from actividad_final import analizar_sargazo_fotogrametria
@@ -61,6 +102,8 @@ Esto genera la figura del pipeline y un reporte con sufijo `_reporte`.
 | `ruta_imagen` | Ruta a la imagen aerea/satelital | requerido |
 | `altura_vuelo_m` | Altitud de toma en metros | requerido |
 | `fov_grados` | Campo de vision horizontal de la camara | `82.0` |
+| `espesor_biomasa_m` | Espesor promedio para estimar volumen | `0.05` |
+| `capacidad_camion_m3` | Capacidad usada para calcular camiones | `14.0` |
 | `mostrar` | Muestra figuras con matplotlib | `True` |
 | `guardar_figura` | Guarda la figura diagnostica en disco | `None` |
 | `devolver_mascaras` | Devuelve mascaras intermedias para depuracion | `False` |

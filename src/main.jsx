@@ -15,8 +15,8 @@ import {
 } from "lucide-react";
 import "./styles.css";
 
-const API_HOST = window.location.hostname === "localhost" ? "localhost" : "127.0.0.1";
-const API_BASE = `http://${API_HOST}:5000`;
+const IS_VITE_DEV = ["localhost", "127.0.0.1"].includes(window.location.hostname) && window.location.port === "5173";
+const API_BASE = IS_VITE_DEV ? `http://${window.location.hostname}:5000` : "";
 const DEFAULT_ESPESOR = "0.05";
 const DEFAULT_CAPACIDAD = "14";
 
@@ -119,9 +119,12 @@ function App() {
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div>
-          <p className="eyebrow">Analisis costero</p>
-          <h1>Estimador de sargazo</h1>
+        <div className="brand-lockup">
+          <img className="brand-icon" src="/zargx-icon.svg" alt="" />
+          <div>
+            <p className="eyebrow">Analisis costero de sargazo</p>
+            <h1>zargx</h1>
+          </div>
         </div>
         <div className="status-pill">
           <Activity size={18} aria-hidden="true" />

@@ -43,6 +43,21 @@ a:focus-visible {
   margin-bottom: 18px;
 }
 
+.brand-lockup {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.brand-icon {
+  width: 54px;
+  height: 54px;
+  flex: 0 0 auto;
+  border-radius: 14px;
+  box-shadow: 0 10px 24px rgb(23 53 58 / 12%);
+}
+
 .eyebrow {
   margin: 0 0 4px;
   color: #5f6f68;
@@ -514,6 +529,10 @@ h2 {
   .topbar {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .brand-lockup {
+    align-items: flex-start;
   }
 
   .artifact-tabs {

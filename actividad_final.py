@@ -57,7 +57,7 @@ def analizar_sargazo_fotogrametria(
     dict  con claves: gsd_m, area_m2, camiones
     """
     print("\n" + "="*60)
-    print("  ANÁLISIS FOTOGRAMÉTRICO DE SARGAZO")
+    print("  ZARGX - ANALISIS FOTOGRAMETRICO DE SARGAZO")
     print("="*60)
     print(f"  Altitud de toma   : {altura_vuelo_m} m")
     print(f"  FOV horizontal    : {fov_grados}°")
@@ -221,7 +221,7 @@ def analizar_sargazo_fotogrametria(
     # ------------------------------------------------------------------
     fig = plt.figure(figsize=(20, 12))
     fig.suptitle(
-        f"Análisis PDI de Sargazo — Toma a {altura_vuelo_m} m de altitud",
+        f"zargx - Analisis PDI de sargazo - Toma a {altura_vuelo_m} m de altitud",
         fontsize=15, fontweight='bold')
 
     # Panel 1: Original
@@ -273,7 +273,7 @@ def analizar_sargazo_fotogrametria(
     # 12. REPORTE TEXTUAL en figura separada
     # ------------------------------------------------------------------
     fig2, ax_rep = plt.subplots(figsize=(9, 5))
-    fig2.suptitle("Reporte Geométrico y Logístico", fontsize=13, fontweight='bold')
+    fig2.suptitle("Reporte zargx", fontsize=13, fontweight='bold')
     ax_rep.axis('off')
     texto = (
         f"FOTOGRAMETRÍA\n"

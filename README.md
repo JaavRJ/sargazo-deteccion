@@ -1,8 +1,8 @@
-# Sargazo Deteccion
+# zargx
 
-Herramienta de procesamiento digital de imagenes (PDI) para detectar y estimar
-el area de sargazo en imagenes aereas/satelitales, con calculo basico de
-logistica de recoleccion.
+zargx es una herramienta de procesamiento digital de imagenes (PDI) para
+detectar y estimar el area de sargazo en imagenes aereas/satelitales, con
+calculo basico de logistica de recoleccion.
 
 ## Que hace
 
@@ -60,6 +60,23 @@ El backend queda en `http://127.0.0.1:5000`. Los resultados temporales se guarda
 en `salidas/`, carpeta ignorada por Git.
 
 Para apagar la app, detén ambos procesos con `Ctrl+C` en sus terminales.
+
+## Deploy en Render
+
+El proyecto esta preparado para desplegarse como un solo Web Service en Render.
+Render construye React en `dist/` y Flask sirve tanto la app como la API desde
+el mismo dominio.
+
+Configuracion recomendada:
+
+```text
+Build command: npm ci && npm run build && pip install -r requirements.txt
+Start command: gunicorn server:app --bind 0.0.0.0:$PORT
+```
+
+Tambien se incluye `render.yaml` para crear el servicio desde Blueprint. En
+produccion la app usa rutas relativas, por lo que `/api/analyze` y `/outputs/`
+funcionan en el mismo dominio publico de Render.
 
 ## Uso desde Python
 

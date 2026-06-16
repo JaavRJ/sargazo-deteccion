@@ -16,11 +16,12 @@ from actividad_final import analizar_sargazo_fotogrametria
 
 
 BASE_DIR = Path(__file__).resolve().parent
+DIST_DIR = BASE_DIR / "dist"
 OUTPUT_DIR = BASE_DIR / "salidas" / "web"
 UPLOAD_DIR = OUTPUT_DIR / "uploads"
 RESULT_DIR = OUTPUT_DIR / "resultados"
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 40 * 1024 * 1024
 
 ALLOWED_ORIGINS = {
@@ -122,6 +123,16 @@ def outputs(filename):
     return send_from_directory(OUTPUT_DIR, filename)
 
 
+@app.get("/")
+def serve_app():
+    return _serve_frontend("index.html")
+
+
+@app.get("/<path:filename>")
+def serve_frontend_asset(filename):
+    return _serve_frontend(filename)
+
+
 def _read_float(name, min_value=None, max_value=None):
     raw = request.form.get(name, "").strip().replace(",", ".")
     try:
@@ -146,6 +157,13 @@ def _output_url(path):
     return f"/outputs/{relative}"
 
 
+def _serve_frontend(filename):
+    asset_path = DIST_DIR / filename
+    if asset_path.is_file():
+        return send_from_directory(DIST_DIR, filename)
+    return send_from_directory(DIST_DIR, "index.html")
+
+
 def _crear_overlay(image_path, mask, output_path):
     img_bgr = cv2.imread(str(image_path))
     if img_bgr is None:
@@ -163,8 +181,8 @@ def _crear_overlay(image_path, mask, output_path):
 
 def _report_text(image_name, result):
     return (
-        "Reporte de sargazo\n"
-        "===================\n\n"
+        "Reporte zargx\n"
+        "=============\n\n"
         f"Imagen: {image_name}\n"
         f"Fecha: {datetime.now():%Y-%m-%d %H:%M:%S}\n\n"
         "Resultados\n"
@@ -184,4 +202,4 @@ def _report_text(image_name, result):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)

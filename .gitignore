@@ -3,7 +3,10 @@ venv
 venv/
 __pycache__/
 salidas/
-.agents/
 node_modules/
 dist/
+
+# Codex/local skills
+.agents/
+.codex/
 skills-lock.json

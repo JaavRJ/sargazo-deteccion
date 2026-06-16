@@ -303,6 +303,6 @@ def analizar_sargazo_fotogrametria(ruta_imagen, altura_vuelo_m, fov_grados=82.0)
 if __name__ == "__main__":
     # Cambia la ruta y la altitud según tu imagen
     resultado = analizar_sargazo_fotogrametria(
-        ruta_imagen    = "prueba1.jpeg",
+        ruta_imagen    = r"C:\Users\jasma\Documents\ESCOM\4to Semestre\PDI\Actividad Final\sargazo-deteccion\Tankah\Captura de pantalla (124).png",
         altura_vuelo_m = 50
     )

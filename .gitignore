@@ -1,3 +1,7 @@
 .venv/
 __pycache__/
 salidas/
+node_modules/
+dist/
+.agents/
+skills-lock.json

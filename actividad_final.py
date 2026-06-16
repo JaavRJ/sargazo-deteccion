@@ -1,299 +1,410 @@
+"""
+analizar_sargazo_riviera.py
+===========================
+Módulo de estimación logística de recolección de sargazo costero.
+Dominio geográfico: corredor Akumal – Bahía Soliman – Tulum.
+Caracterización del dominio: arena coralina blanca (alta reflectancia),
+agua de baja turbidez (cian claro), iluminación tropical directa.
+
+Restricciones de implementación:
+  - Álgebra de matrices espaciales pura (OpenCV + NumPy + math).
+  - Sin ML, sin cv2.findContours, sin cv2.connectedComponentsWithStats.
+  - Todas las funciones son puras, sin efectos secundarios.
+"""
+
+import math
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-import math
-
-# =============================================================================
-# CORRECCIONES AL PIPELINE ORIGINAL  (resumen de cambios)
-# =============================================================================
-# PROBLEMA 1 - Rango HSV demasiado amplio:
-#   Original: inRange([5,50,20], [30,255,150]) → captura arena, techos, suelo seco
-#   Solución: restricción adicional por índices espectrales (R-B, G-R) y
-#             máscaras de exclusión por clase (agua, vegetación, arena, techos).
-#
-# PROBLEMA 2 - Un solo umbral HSV no discrimina bien en imágenes satelitales:
-#   Solución: segmentación multi-condición (H + S + V + índices de color)
-#             combinada con exclusión de clases de fondo.
-#
-# PROBLEMA 3 - Morfología insuficiente (solo mediana + cierre):
-#   Original: medianBlur(5) + MORPH_CLOSE(5×5)
-#   Solución: pipeline morfológico de 4 pasos ordenados:
-#             mediana → apertura (elimina ruido) → cierre (conecta partes)
-#             → dilatación/erosión balanceada (rellena huecos sin inflar).
-#
-# PROBLEMA 4 - Sin filtrado por área de contornos:
-#   Solución: descarta blobs < área mínima, eliminando falsos positivos aislados.
-# =============================================================================
 
 
-def analizar_sargazo_fotogrametria(ruta_imagen, altura_vuelo_m, fov_grados=82.0):
+# =============================================================================
+# BLOQUE I — FUNCIONES PRIMITIVAS DE PDI
+# =============================================================================
+
+def convertir_a_hsv_canal(img_bgr, canal):
     """
-    Segmenta sargazo costero y calcula logística de recolección usando
-    principios de fotogrametría (GSD) y un pipeline PDI multi-etapa mejorado.
+    Convierte una imagen BGR al espacio HSV y extrae un canal individual.
+
+    canal: 0 = Tono (H)   [0 – 179]
+           1 = Saturación (S) [0 – 255]
+           2 = Valor / Brillo (V) [0 – 255]
+    Retorna: ndarray float32 del canal solicitado.
+    """
+    img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    return img_hsv[:, :, canal].astype(np.float32)
+
+
+def segmentar_umbral(canal_f, tipo, t1=None, t2=None):
+    """
+    Binariza un canal con la estrategia indicada.
+
+    tipo="banda"    → 255 donde t1 ≤ canal ≤ t2   (umbralización de banda)
+    tipo="fija"     → 255 donde canal  > t1         (umbral fijo manual)
+    tipo="otsu"     → umbral global automático (Otsu)
+    tipo="media"    → umbral = media del canal
+    tipo="inversa"  → NOT del umbral fijo (complementaria)
+    tipo="kapur"    → búsqueda de entropía máxima (Kapur) sobre el histograma
+
+    Retorna: máscara binaria uint8 (0 / 255).
+    """
+    c = np.clip(canal_f, 0, 255).astype(np.uint8)
+
+    if tipo == "banda":
+        return cv2.inRange(c,
+                           np.array(int(t1), dtype=np.uint8),
+                           np.array(int(t2), dtype=np.uint8))
+
+    if tipo == "fija":
+        _, m = cv2.threshold(c, int(t1), 255, cv2.THRESH_BINARY)
+        return m
+
+    if tipo == "otsu":
+        _, m = cv2.threshold(c, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return m
+
+    if tipo == "media":
+        t_media = float(c.mean())
+        _, m = cv2.threshold(c, t_media, 255, cv2.THRESH_BINARY)
+        return m
+
+    if tipo == "inversa":
+        _, m = cv2.threshold(c, int(t1), 255, cv2.THRESH_BINARY_INV)
+        return m
+
+    if tipo == "kapur":
+        hist = cv2.calcHist([c], [0], None, [256], [0, 256]).flatten()
+        hist_norm = hist / (hist.sum() + 1e-10)
+        mejor_t, mejor_H = 0, -np.inf
+        for t in range(1, 255):
+            p0 = hist_norm[:t];  p1 = hist_norm[t:]
+            s0 = p0.sum();       s1 = p1.sum()
+            if s0 < 1e-10 or s1 < 1e-10:
+                continue
+            e0 = -np.sum((p0 / s0) * np.log2(p0 / s0 + 1e-10))
+            e1 = -np.sum((p1 / s1) * np.log2(p1 / s1 + 1e-10))
+            H_total = e0 + e1
+            if H_total > mejor_H:
+                mejor_H = H_total
+                mejor_t = t
+        _, m = cv2.threshold(c, mejor_t, 255, cv2.THRESH_BINARY)
+        return m
+
+    raise ValueError(f"Tipo de umbralización desconocido: '{tipo}'")
+
+
+def morfologia(mask, op, k):
+    """
+    Aplica una operación morfológica sobre una máscara binaria.
+
+    op: "apertura"   → erosión → dilatación   (elimina ruido pequeño)
+        "cierre"     → dilatación → erosión   (consolida regiones)
+        "dilatacion" → dilatación simple
+        "erosion"    → erosión simple
+        "gradiente"  → diferencia dilatación − erosión (realza bordes)
+        "tophat"     → imagen original − apertura (resalta picos claros)
+        "blackhat"   → cierre − imagen original (resalta valles oscuros)
+
+    k: lado del elemento estructurante elíptico (píxeles).
+    Retorna: máscara morfológicamente transformada (uint8).
+    """
+    elem = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(k), int(k)))
+    tabla = {
+        "apertura"  : cv2.MORPH_OPEN,
+        "cierre"    : cv2.MORPH_CLOSE,
+        "dilatacion": cv2.MORPH_DILATE,
+        "erosion"   : cv2.MORPH_ERODE,
+        "gradiente" : cv2.MORPH_GRADIENT,
+        "tophat"    : cv2.MORPH_TOPHAT,
+        "blackhat"  : cv2.MORPH_BLACKHAT,
+    }
+    if op not in tabla:
+        raise ValueError(f"Operación morfológica desconocida: '{op}'")
+    return cv2.morphologyEx(mask, tabla[op], elem)
+
+
+def expansion_histograma(canal_f):
+    """
+    Estiramiento lineal del histograma al rango [0, 255].
+
+    Normaliza el canal para que su mínimo → 0 y su máximo → 255,
+    mejorando el contraste global antes de la segmentación.
+    Retorna: canal float32 en [0, 255].
+    """
+    c_min = canal_f.min()
+    c_max = canal_f.max()
+    rango = c_max - c_min + 1e-8
+    return ((canal_f - c_min) / rango * 255.0).astype(np.float32)
+
+
+def filtro_bilateral(img_bgr, d=7, sigma_color=35, sigma_space=35):
+    """
+    Filtro bilateral: suaviza preservando los bordes del sargazo.
+
+    A diferencia del Gaussiano puro, el bilateral pondera cada píxel
+    vecino por su similitud de color, conservando las fronteras entre
+    clases espectralmente distintas (sargazo / arena / agua).
+
+    Retorna: imagen BGR filtrada (uint8).
+    """
+    return cv2.bilateralFilter(img_bgr, d=int(d),
+                               sigmaColor=float(sigma_color),
+                               sigmaSpace=float(sigma_space))
+
+
+def realce_blackhat(canal_v_f, k=15):
+    """
+    Black-hat morfológico sobre el canal de Valor (V).
+
+    Calcula: cierre(V) − V, que resalta las zonas OSCURAS sobre un
+    fondo claro. En el dominio Akumal-Tulum (arena coralina muy blanca),
+    el sargazo marrón aparece como un valle oscuro → el Black-hat lo
+    amplifica y facilita su binarización posterior.
+
+    Retorna: imagen de realce uint8 en [0, 255].
+    """
+    v_uint8 = np.clip(canal_v_f, 0, 255).astype(np.uint8)
+    elem = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(k), int(k)))
+    return cv2.morphologyEx(v_uint8, cv2.MORPH_BLACKHAT, elem)
+
+
+# =============================================================================
+# BLOQUE II — FUNCIÓN PRINCIPAL
+# =============================================================================
+
+def analizar_sargazo_riviera(ruta_imagen, altura_vuelo_m, fov_grados=82.0):
+    """
+    Pipeline completo de segmentación de sargazo y estimación logística.
 
     Parámetros
     ----------
-    ruta_imagen   : str   Ruta a la imagen aérea/satelital.
-    altura_vuelo_m: float Altitud de toma en metros.
-    fov_grados    : float Campo de visión horizontal de la cámara (por defecto 82°).
+    ruta_imagen    : str   Ruta a la imagen satelital (JPG / PNG).
+    altura_vuelo_m : float Altitud de la toma en metros.
+    fov_grados     : float Campo de visión horizontal de la cámara (default 82°).
 
     Retorna
     -------
-    dict  con claves: gsd_m, area_m2, camiones
+    dict  {gsd_m, area_m2, volumen_m3, camiones, pixeles_sargazo}
     """
-    print("\n" + "="*60)
-    print("  ANÁLISIS FOTOGRAMÉTRICO DE SARGAZO")
-    print("="*60)
-    print(f"  Altitud de toma   : {altura_vuelo_m} m")
-    print(f"  FOV horizontal    : {fov_grados}°")
 
-    # ------------------------------------------------------------------
-    # 1. CARGA Y VALIDACIÓN DE IMAGEN
-    # ------------------------------------------------------------------
+    print("\n" + "=" * 62)
+    print("  ANÁLISIS SARGAZO — CORREDOR AKUMAL · SOLIMAN · TULUM")
+    print("=" * 62)
+
+    # ─────────────────────────────────────────────────────────────────
+    # PASO 1 — CARGA Y VALIDACIÓN
+    # ─────────────────────────────────────────────────────────────────
     img_bgr = cv2.imread(ruta_imagen)
     if img_bgr is None:
-        raise ValueError(f"No se pudo cargar la imagen: {ruta_imagen}")
-
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        raise ValueError(f"No se pudo cargar la imagen: '{ruta_imagen}'")
+    img_rgb    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     alto_px, ancho_px = img_bgr.shape[:2]
-    print(f"  Resolución imagen : {ancho_px} × {alto_px} px")
+    print(f"  Resolución         : {ancho_px} × {alto_px} px")
 
-    # ------------------------------------------------------------------
-    # 2. FOTOGRAMETRÍA — GSD (Ground Sample Distance)
-    # ------------------------------------------------------------------
-    fov_rad         = math.radians(fov_grados)
-    ancho_fisico_m  = 2 * altura_vuelo_m * math.tan(fov_rad / 2)
-    gsd_m_px        = ancho_fisico_m / ancho_px          # metros por píxel
-    area_px_m2      = gsd_m_px ** 2                       # m² por píxel
+    # ─────────────────────────────────────────────────────────────────
+    # PASO 2 — FOTOGRAMETRÍA DINÁMICA (GSD)
+    # ─────────────────────────────────────────────────────────────────
+    fov_rad       = math.radians(fov_grados)
+    ancho_fisico  = 2.0 * altura_vuelo_m * math.tan(fov_rad / 2.0)
+    gsd_m_px      = ancho_fisico / ancho_px
+    area_px_m2    = gsd_m_px ** 2
+    print(f"  Altitud / FOV      : {altura_vuelo_m} m  /  {fov_grados}°")
+    print(f"  GSD                : {gsd_m_px:.5f} m/px")
+    print(f"  Área por píxel     : {area_px_m2:.7f} m²")
 
-    print(f"  GSD               : {gsd_m_px:.4f} m/px")
-    print(f"  Área por píxel    : {area_px_m2:.6f} m²")
+    # ─────────────────────────────────────────────────────────────────
+    # PASO 3 — PREPROCESAMIENTO ESPECTRAL
+    #
+    # 3a. Filtro bilateral: elimina ruido de texturas del mar y de
+    #     la selva preservando los bordes espectrales del sargazo.
+    # 3b. Black-hat morfológico sobre V: amplifica el sargazo oscuro
+    #     frente a la arena coralina blanca característica del dominio.
+    # 3c. Expansión de histograma sobre S: maximiza el contraste entre
+    #     el sargazo (saturación media) y la espuma blanca (S≈0) o el
+    #     agua turquesa (S alta) antes de binarizar.
+    # ─────────────────────────────────────────────────────────────────
+    img_pre  = filtro_bilateral(img_bgr, d=7, sigma_color=35, sigma_space=35)
 
-    # ------------------------------------------------------------------
-    # 3. PREPROCESAMIENTO — CLAHE para realce de contraste local
-    #    Mejora la discriminación entre sargazo y fondo en imágenes
-    #    con iluminación desigual (tomadas a distintas horas del día).
-    # ------------------------------------------------------------------
-    gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    clahe  = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    gray_eq = clahe.apply(gray)   # se usa solo para visualización diagnóstica
+    canal_H  = convertir_a_hsv_canal(img_pre, 0)
+    canal_S  = convertir_a_hsv_canal(img_pre, 1)
+    canal_V  = convertir_a_hsv_canal(img_pre, 2)
 
-    # ------------------------------------------------------------------
-    # 4. SEPARACIÓN DE CANALES EN MÚLTIPLES ESPACIOS DE COLOR
-    # ------------------------------------------------------------------
-    img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    canal_S_exp = expansion_histograma(canal_S)
 
-    # Canales HSV como arreglos float para cálculos aritméticos
-    H = img_hsv[:, :, 0].astype(float)   # Tono       [0–179]
-    S = img_hsv[:, :, 1].astype(float)   # Saturación [0–255]
-    V = img_hsv[:, :, 2].astype(float)   # Valor      [0–255]
+    blackhat_V  = realce_blackhat(canal_V, k=15).astype(np.float32)
 
-    # Canales BGR como float para índices espectrales
-    R = img_bgr[:, :, 2].astype(float)
-    G = img_bgr[:, :, 1].astype(float)
-    B = img_bgr[:, :, 0].astype(float)
+    # ─────────────────────────────────────────────────────────────────
+    # PASO 4 — TRIPLE CONDICIÓN HSV (arquitectura obligatoria)
+    #
+    # Umbrales calibrados sobre el corredor Akumal-Tulum:
+    #
+    # H ∈ [5, 28]:
+    #   Retiene solo tonos rojo-naranja-marrón del sargazo seco.
+    #   En el espacio HSV, el marrón cae entre H=5 y H=28.
+    #   El agua cian del Caribe tiene H > 85 → queda fuera.
+    #   La arena coralina tiene H variable; la condición S la excluye.
+    #
+    # S ∈ [40, 255] (sobre el canal expandido):
+    #   La arena blanca y la espuma tienen S ≈ 0–25 → excluidas.
+    #   El agua tiene S alta pero es filtrada por H y V.
+    #   El sargazo posee saturación moderada → sobrevive.
+    #
+    # V ∈ [20, 140]:
+    #   Excluye sombras de la selva (V < 20) y brillos de sol
+    #   sobre arena o espuma (V > 140).
+    #   El sargazo marrón oscuro ocupa V ≈ 30–135 en este dominio.
+    # ─────────────────────────────────────────────────────────────────
+    m_H      = segmentar_umbral(canal_H,     tipo="banda", t1=5,  t2=28)
+    m_S      = segmentar_umbral(canal_S_exp, tipo="banda", t1=40, t2=255)
+    m_V      = segmentar_umbral(canal_V,     tipo="banda", t1=20, t2=140)
 
-    # ------------------------------------------------------------------
-    # 5. MÁSCARA POSITIVA — Candidatos a sargazo
-    #    Criterios derivados del análisis espectral de la imagen:
-    #    • H < 22 o H > 155 → tonos rojo-naranja-marrón
-    #    • S ∈ [14, 159]   → saturación baja/media (sargazo seco no muy vívido)
-    #    • V ∈ [18, 144]   → brillo bajo/medio (más oscuro que la arena)
-    #    • R − B > 4       → componente rojiza siempre presente en marrón
-    #    • G − R < 18      → excluye vegetación viva (clorofila: G >> R)
-    # ------------------------------------------------------------------
-    cond_H    = (H < 22) | (H > 155)
-    cond_S    = (S > 14) & (S < 160)
-    cond_V    = (V > 18) & (V < 145)
-    cond_RB   = (R - B) > 4
-    cond_noveg = (G - R) < 18
+    m_triple = cv2.bitwise_and(cv2.bitwise_and(m_H, m_S), m_V)
 
-    mascara_positiva = (cond_H & cond_S & cond_V & cond_RB & cond_noveg
-                        ).astype(np.uint8) * 255
+    # ─────────────────────────────────────────────────────────────────
+    # PASO 5 — CONDICIÓN ESPECTRAL COMPLEMENTARIA (sugerencia PDI)
+    #
+    # 5a. Binarización del Black-hat:
+    #     Umbral de Otsu sobre el mapa black-hat de V para detectar
+    #     las zonas oscuras que el Black-hat resaltó (sargazo en arena).
+    #     Se usa Otsu porque la distribución bimodal (arena vs sargazo)
+    #     hace que Otsu encuentre el umbral óptimo automáticamente.
+    #
+    # 5b. Exclusión de agua pura por H:
+    #     El agua del Caribe tiene siempre H > 85 en este dominio.
+    #     Una binarización inversa sobre H genera una máscara de
+    #     "no-agua" que elimina falsos positivos en zonas submarinas.
+    #     Se aplica como AND lógico sobre m_triple.
+    #
+    # 5c. Combinación OR lógica:
+    #     m_reforzada = triple AND blackhat_otsu (sargazo sobre arena)
+    #     m_noagua    = triple AND no-agua        (sargazo en orilla)
+    #     La unión (OR) maximiza la sensibilidad sin perder precisión.
+    # ─────────────────────────────────────────────────────────────────
+    m_blackhat_bin = segmentar_umbral(blackhat_V, tipo="otsu")
+    m_no_agua      = segmentar_umbral(canal_H, tipo="inversa", t1=84)
 
-    # ------------------------------------------------------------------
-    # 6. MÁSCARAS DE EXCLUSIÓN POR CLASE
-    #    Eliminan falsos positivos (FP) que también caen en el rango HSV.
-    # ------------------------------------------------------------------
+    m_reforzada = cv2.bitwise_and(m_triple, m_blackhat_bin)
+    m_costa     = cv2.bitwise_and(m_triple, m_no_agua)
+    m_candidatos = cv2.bitwise_or(m_reforzada, m_costa)
 
-    # 6a. Agua / mar: tono azul-verdoso con saturación apreciable
-    excl_agua = (H >= 70) & (H <= 135) & (S > 30)
+    # ─────────────────────────────────────────────────────────────────
+    # PASO 6 — MORFOLOGÍA DE LATICES
+    #
+    # 6a. Filtro de mediana (3×3):
+    #     Elimina ruido sal-pimienta (píxeles aislados) antes de
+    #     la morfología estructural, sin desplazar los bordes.
+    #
+    # 6b. Apertura (k=3):
+    #     Erosión seguida de dilatación con kernel pequeño.
+    #     Borra objetos más pequeños que el kernel (ruido impulsivo,
+    #     artefactos de espuma aislados) conservando el sargazo.
+    #
+    # 6c. Cierre (k=5):
+    #     Dilatación seguida de erosión con kernel mayor.
+    #     Conecta fragmentos de biomasa próximos (el sargazo se
+    #     deposita en manchas irregulares con huecos internos)
+    #     y rellena agujeros menores al kernel.
+    # ─────────────────────────────────────────────────────────────────
+    m_median   = cv2.medianBlur(m_candidatos, 3)
+    m_apertura = morfologia(m_median,   op="apertura", k=3)
+    m_final    = morfologia(m_apertura, op="cierre",   k=5)
 
-    # 6b. Vegetación verde brillante: H verde, saturación alta, brillo alto
-    excl_vegetacion = (H >= 32) & (H <= 82) & (S > 75) & (V > 85)
+    # ─────────────────────────────────────────────────────────────────
+    # PASO 7 — CÁLCULO LOGÍSTICO MATRICIAL
+    # ─────────────────────────────────────────────────────────────────
+    pixeles_sargazo = cv2.countNonZero(m_final)
+    area_total_m2   = pixeles_sargazo * area_px_m2
+    volumen_m3      = area_total_m2 * 0.05
+    cap_camion_m3   = 14.0
+    camiones        = int(math.ceil(volumen_m3 / cap_camion_m3)) if volumen_m3 > 0 else 0
 
-    # 6c. Arena / suelo claro: brillo muy alto con saturación mínima
-    excl_arena = (V > 152) & (S < 45)
+    print(f"\n  {'─' * 48}")
+    print(f"  Píxeles de sargazo   : {pixeles_sargazo:>12,} px")
+    print(f"  Área estimada        : {area_total_m2:>12,.4f} m²")
+    print(f"  Volumen de biomasa   : {volumen_m3:>12,.4f} m³")
+    print(f"  Camiones requeridos  : {camiones:>12}")
+    print(f"  {'─' * 48}\n")
 
-    # 6d. Techos y estructuras: tonos rojizos MUY saturados y brillantes
-    excl_techos = (H < 20) & (S > 130) & (V > 120)
-
-    excl_total = (excl_agua | excl_vegetacion | excl_arena | excl_techos
-                  ).astype(np.uint8) * 255
-
-    # Máscara de sargazo con FP descartados
-    mascara_filtrada = cv2.bitwise_and(mascara_positiva,
-                                       cv2.bitwise_not(excl_total))
-
-    # ------------------------------------------------------------------
-    # 7. MORFOLOGÍA — Pipeline de 4 pasos
-    # ------------------------------------------------------------------
-
-    # 7a. Filtro de mediana: elimina ruido sal-pimienta (píxeles aislados)
-    m1 = cv2.medianBlur(mascara_filtrada, 5)
-
-    # 7b. Apertura morfológica: elimina regiones pequeñas e irrelevantes
-    k_apertura = np.ones((3, 3), np.uint8)
-    m2 = cv2.morphologyEx(m1, cv2.MORPH_OPEN, k_apertura)
-
-    # 7c. Cierre morfológico: une fragmentos de la banda de sargazo
-    #     Kernel elíptico (más natural que cuadrado)
-    k_cierre = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    m3 = cv2.morphologyEx(m2, cv2.MORPH_CLOSE, k_cierre)
-
-    # 7d. Dilatación + erosión balanceada: rellena huecos internos sin inflar
-    k_balance = np.ones((5, 5), np.uint8)
-    m4 = cv2.dilate(m3, k_balance, iterations=1)
-    m5 = cv2.erode(m4,  k_balance, iterations=1)
-
-    # ------------------------------------------------------------------
-    # 8. FILTRADO POR ÁREA DE CONTORNOS
-    #    Descarta blobs cuya área sea menor a un umbral mínimo.
-    #    Calcula el GSD-equivalente en m² para convertir al mundo real.
-    # ------------------------------------------------------------------
-    AREA_MIN_PX = 100   # píxeles² mínimo por blob
-
-    contornos, _ = cv2.findContours(m5, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)
-    mascara_final = np.zeros_like(m5)
-    blobs_validos = []
-
-    for cnt in contornos:
-        area_px = cv2.contourArea(cnt)
-        if area_px >= AREA_MIN_PX:
-            cv2.drawContours(mascara_final, [cnt], -1, 255, -1)
-            blobs_validos.append((area_px, cnt))
-
-    # Ordenar por área descendente (mayor primero)
-    blobs_validos.sort(key=lambda x: -x[0])
-
-    # ------------------------------------------------------------------
-    # 9. CÁLCULO DE ÁREA TOTAL Y MODELO LOGÍSTICO
-    # ------------------------------------------------------------------
-    pixeles_sargazo   = cv2.countNonZero(mascara_final)
-    area_total_m2     = pixeles_sargazo * area_px_m2
-
-    # Estimación de volumen: altura media de 5 cm para sargazo depositado
-    volumen_m3        = area_total_m2 * 0.05
-    cap_camion_m3     = 14.0
-    camiones_req      = int(np.ceil(volumen_m3 / cap_camion_m3))
-
-    print(f"\n  --- RESULTADOS ---")
-    print(f"  Blobs sargazo detectados : {len(blobs_validos)}")
-    print(f"  Píxeles de sargazo       : {pixeles_sargazo:,}")
-    print(f"  Área estimada            : {area_total_m2:,.2f} m²")
-    print(f"  Volumen estimado         : {volumen_m3:,.2f} m³")
-    print(f"  Camiones requeridos      : {camiones_req}")
-
-    # ------------------------------------------------------------------
-    # 10. DETECCIÓN DE CONTORNOS FINALES para visualización
-    # ------------------------------------------------------------------
-    img_contornos = img_rgb.copy()
-    for _, cnt in blobs_validos:
-        cv2.drawContours(img_contornos, [cnt], -1, (255, 80, 0), 2)
-
-    # ------------------------------------------------------------------
-    # 11. VISUALIZACIÓN — 6 paneles del pipeline
-    # ------------------------------------------------------------------
-    fig = plt.figure(figsize=(20, 12))
-    fig.suptitle(
-        f"Análisis PDI de Sargazo — Toma a {altura_vuelo_m} m de altitud",
-        fontsize=15, fontweight='bold')
-
-    # Panel 1: Original
-    ax1 = fig.add_subplot(2, 3, 1)
-    ax1.imshow(img_rgb)
-    ax1.set_title("1. Imagen Original (RGB)", fontsize=11)
-    ax1.axis('off')
-
-    # Panel 2: CLAHE (realce de contraste)
-    ax2 = fig.add_subplot(2, 3, 2)
-    ax2.imshow(gray_eq, cmap='gray')
-    ax2.set_title("2. Realce CLAHE\n(contraste local adaptativo)", fontsize=11)
-    ax2.axis('off')
-
-    # Panel 3: Máscara positiva inicial (antes de exclusiones)
-    ax3 = fig.add_subplot(2, 3, 3)
-    ax3.imshow(mascara_positiva, cmap='gray')
-    ax3.set_title("3. Máscara Inicial\n(HSV + índices R-B, G-R)", fontsize=11)
-    ax3.axis('off')
-
-    # Panel 4: Máscara tras exclusión
-    ax4 = fig.add_subplot(2, 3, 4)
-    ax4.imshow(mascara_filtrada, cmap='gray')
-    ax4.set_title("4. Tras Exclusión\n(descarte agua, veg., arena, techos)", fontsize=11)
-    ax4.axis('off')
-
-    # Panel 5: Máscara morfológica final
-    ax5 = fig.add_subplot(2, 3, 5)
-    ax5.imshow(mascara_final, cmap='gray')
-    ax5.set_title("5. Máscara Final\n(morfología + filtro área)", fontsize=11)
-    ax5.axis('off')
-
-    # Panel 6: Overlay + contornos + reporte
-    ax6 = fig.add_subplot(2, 3, 6)
+    # ─────────────────────────────────────────────────────────────────
+    # PASO 8 — SALIDA VISUAL (grid matplotlib)
+    # ─────────────────────────────────────────────────────────────────
     overlay = img_rgb.copy()
-    overlay[mascara_final > 0] = [220, 80, 20]
-    blended = cv2.addWeighted(img_rgb, 0.55, overlay, 0.45, 0)
-    ax6.imshow(blended)
-    for _, cnt in blobs_validos:
-        cnt_squeezed = cnt.squeeze()
-        if cnt_squeezed.ndim == 2:
-            ax6.plot(np.append(cnt_squeezed[:, 0], cnt_squeezed[0, 0]),
-                     np.append(cnt_squeezed[:, 1], cnt_squeezed[0, 1]),
-                     color='yellow', linewidth=1.2, alpha=0.85)
-    ax6.set_title("6. Sargazo Segmentado\n(overlay naranja + contornos)", fontsize=11)
-    ax6.axis('off')
+    overlay[m_final > 0] = [220, 60, 0]
+    blend   = cv2.addWeighted(img_rgb, 0.52, overlay, 0.48, 0)
 
-    # ------------------------------------------------------------------
-    # 12. REPORTE TEXTUAL en figura separada
-    # ------------------------------------------------------------------
-    fig2, ax_rep = plt.subplots(figsize=(9, 5))
-    fig2.suptitle("Reporte Geométrico y Logístico", fontsize=13, fontweight='bold')
-    ax_rep.axis('off')
-    texto = (
-        f"FOTOGRAMETRÍA\n"
-        f"{'─'*38}\n"
-        f"  Campo de visión (FOV)      : {fov_grados}°\n"
-        f"  GSD (tamaño de píxel)      : {gsd_m_px:.4f} m/px\n"
-        f"  Área por píxel             : {area_px_m2:.6f} m²\n"
-        f"  Cobertura imagen           : {ancho_px} × {alto_px} px\n\n"
-        f"SEGMENTACIÓN PDI\n"
-        f"{'─'*38}\n"
-        f"  Blobs detectados           : {len(blobs_validos)}\n"
-        f"  Píxeles de sargazo         : {pixeles_sargazo:,} px\n"
-        f"  Área real estimada         : {area_total_m2:,.2f} m²\n\n"
-        f"LOGÍSTICA DE RECOLECCIÓN\n"
-        f"{'─'*38}\n"
-        f"  Espesor biomasa asumido    : 0.05 m\n"
-        f"  Volumen de biomasa         : {volumen_m3:,.2f} m³\n"
-        f"  Capacidad camión           : {cap_camion_m3:.1f} m³\n"
-        f"  🚛 Camiones requeridos     : {camiones_req}\n"
+    fig = plt.figure(figsize=(22, 12))
+    fig.patch.set_facecolor("#16161e")
+    fig.suptitle(
+        f"Análisis de Sargazo — Corredor Akumal · Soliman · Tulum"
+        f"   |   Altitud {altura_vuelo_m} m",
+        fontsize=14, fontweight="bold", color="white", y=1.005
     )
-    ax_rep.text(0.04, 0.97, texto,
-                transform=ax_rep.transAxes,
-                fontsize=11, verticalalignment='top',
-                fontfamily='monospace',
-                bbox=dict(facecolor='#f7f7f7', alpha=0.9,
-                          boxstyle='round,pad=0.8', edgecolor='#cccccc'))
 
+    specs = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.08)
+    paneles = [
+        (specs[0, 0], img_rgb,    None,   "① Imagen original (RGB)"),
+        (specs[0, 1], m_H,        "gray", f"② Máscara H  [5 – 28]\n"
+                                           f"Sargazo marrón-rojizo"),
+        (specs[0, 2], m_S,        "gray", f"③ Máscara S  [40 – 255]\n"
+                                           f"(canal expandido — excluye arena/espuma)"),
+        (specs[1, 0], m_V,        "gray", f"④ Máscara V  [20 – 140]\n"
+                                           f"Excluye sombras y brillos"),
+        (specs[1, 1], m_final,    "gray", f"⑤ Máscara final\n"
+                                           f"(triple HSV + blackhat + morfo)"),
+        (specs[1, 2], blend,      None,   f"⑥ Overlay sargazo (naranja)\n"
+                                           f"{pixeles_sargazo:,} px  ·  "
+                                           f"{area_total_m2:,.2f} m²"),
+    ]
+
+    for spec, data, cmap, titulo in paneles:
+        ax = fig.add_subplot(spec)
+        ax.imshow(data, cmap=cmap)
+        ax.set_title(titulo, color="white", fontsize=9.5,
+                     fontweight="bold", pad=5)
+        ax.set_facecolor("#16161e")
+        ax.axis("off")
+
+    fig2, ax_rep = plt.subplots(figsize=(10, 5.5))
+    fig2.patch.set_facecolor("#16161e")
+    ax_rep.set_facecolor("#16161e")
+    fig2.suptitle("Reporte Logístico de Recolección",
+                  fontsize=14, fontweight="bold", color="white")
+    ax_rep.axis("off")
+
+    txt = (
+        f"FOTOGRAMETRÍA\n{'─' * 44}\n"
+        f"  FOV horizontal           : {fov_grados}°\n"
+        f"  GSD (metros por píxel)   : {gsd_m_px:.5f} m/px\n"
+        f"  Área por píxel           : {area_px_m2:.7f} m²\n"
+        f"  Resolución de la imagen  : {ancho_px} × {alto_px} px\n\n"
+        f"SEGMENTACIÓN PDI\n{'─' * 44}\n"
+        f"  Máscara H activa (5-28)  : {cv2.countNonZero(m_H):>10,} px\n"
+        f"  Máscara S activa (40-255): {cv2.countNonZero(m_S):>10,} px\n"
+        f"  Máscara V activa (20-140): {cv2.countNonZero(m_V):>10,} px\n"
+        f"  Intersección triple AND  : {cv2.countNonZero(m_triple):>10,} px\n"
+        f"  Pixeles finales sargazo  : {pixeles_sargazo:>10,} px\n\n"
+        f"LOGÍSTICA DE RECOLECCIÓN\n{'─' * 44}\n"
+        f"  Área real estimada       : {area_total_m2:>10,.4f} m²\n"
+        f"  Espesor de biomasa       : 0.05 m\n"
+        f"  Volumen de biomasa       : {volumen_m3:>10,.4f} m³\n"
+        f"  Capacidad por camión     : {cap_camion_m3:.1f} m³\n"
+        f"  Camiones requeridos      : {camiones:>10}\n"
+    )
+    ax_rep.text(0.04, 0.97, txt,
+                transform=ax_rep.transAxes,
+                fontsize=11, verticalalignment="top",
+                fontfamily="monospace", color="#dcdcdc",
+                bbox=dict(facecolor="#1e1e2e", alpha=0.95,
+                          boxstyle="round,pad=0.9", edgecolor="#44445e"))
     plt.tight_layout()
     plt.show()
 
     return {
-        "gsd_m"   : gsd_m_px,
-        "area_m2" : area_total_m2,
-        "camiones": camiones_req,
+        "gsd_m"          : gsd_m_px,
+        "area_m2"        : area_total_m2,
+        "volumen_m3"     : volumen_m3,
+        "camiones"       : camiones,
+        "pixeles_sargazo": pixeles_sargazo,
     }
 
 
@@ -301,8 +412,7 @@ def analizar_sargazo_fotogrametria(ruta_imagen, altura_vuelo_m, fov_grados=82.0)
 # EJECUCIÓN
 # =============================================================================
 if __name__ == "__main__":
-    # Cambia la ruta y la altitud según tu imagen
-    resultado = analizar_sargazo_fotogrametria(
-        ruta_imagen    = r"C:\Users\jasma\Documents\ESCOM\4to Semestre\PDI\Actividad Final\sargazo-deteccion\Tankah\Captura de pantalla (124).png",
-        altura_vuelo_m = 50
+    analizar_sargazo_riviera(
+        ruta_imagen    = r"C:\Users\jasma\Documents\ESCOM\4to Semestre\PDI\Actividad Final\sargazo-deteccion\Tankah\Captura de pantalla (127).png",
+        altura_vuelo_m = 200
     )
